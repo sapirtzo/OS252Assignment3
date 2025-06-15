@@ -681,59 +681,76 @@ procdump(void)
     printf("\n");
   }
 }
-// vm.c?
-uint64 map_shared_pages(struct proc* src_proc, struct proc* dst_proc, uint64 src_va, uint size){
+
+uint64 map_shared_pages(struct proc *src_proc, struct proc *dst_proc, uint64 src_va, uint64 size)
+{
   uint64 src_start = PGROUNDDOWN(src_va);
   uint64 src_end = PGROUNDUP(src_va + size);
-
   uint64 offset = src_va - src_start;
+  uint64 dst_base;
 
-  for(uint64 addr = src_start; addr < src_end; addr += PGSIZE){
-    pte_t *pte = walk(src_proc->pagetable, addr, 0);
+  acquire(&dst_proc->lock);
+  dst_base = dst_proc->sz;
 
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){
-      printf("DEBUG: walk failed - map_shared_pages\n");
-      return -1; // TODO: is uvmunmap required?
+  for (uint64 a = src_start; a < src_end; a += PGSIZE)
+  {
+    pte_t *pte = walk(src_proc->pagetable, a, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+    {
+      release(&dst_proc->lock);
+      return -1;
     }
 
     uint64 pa = PTE2PA(*pte);
 
-    if(mappages(dst_proc->pagetable, dst_proc->sz, PGSIZE, pa, PTE_FLAGS(*pte) | PTE_S) != 0){
-      printf("DEBUG: mappages failed - map_shared_pages\n");
-      return -1;// TODO: is uvmunmap required?
+    if (mappages(dst_proc->pagetable, dst_proc->sz, PGSIZE, pa, PTE_FLAGS(*pte) | PTE_S) != 0)
+    {
+      release(&dst_proc->lock);
+      return -1;
     }
 
     dst_proc->sz += PGSIZE;
   }
-  return dst_proc->sz + offset;
+
+  release(&dst_proc->lock);
+  return dst_base + offset;
 }
 
-uint64 unmap_shared_pages(struct proc* p, uint64 addr, uint64 size){
+uint64 unmap_shared_pages(struct proc *p, uint64 addr, uint64 size)
+{
   uint64 start = PGROUNDDOWN(addr);
   uint64 end = PGROUNDUP(addr + size);
   uint64 map_size = end - start;
-  uint64 npages = map_size / PGSIZE;
 
-  for(uint64 s = start; s < end; s += PGSIZE){
-        pte_t *pte = walk(p->pagetable, s, 0);
-
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){
-      printf("DEBUG: walk failed - unmap_shared_pages\n");
+  for (uint64 a = start; a < end; a += PGSIZE)
+  {
+    pte_t *pte = walk(p->pagetable, a, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_S) == 0) {
+      printf("unmap_shared_pages: address %p is not a valid shared mapping\n", a);
       return -1;
     }
+
+    // Clear the PTE manually, without freeing the physical page
+    *pte = 0;
   }
 
-  uvmunmap(p->pagetable, start, npages, 1);
+  // Flush the TLB (in xv6 it's needed to prevent stale mappings)
+  sfence_vma();
 
   p->sz -= map_size;
   return 0;
 }
 
 struct proc* FindProc(int pid){
-  for(int p = 0; p < NPROC; p++){
-    if(proc[p].pid == pid){
-      return &proc[p];
+  struct proc *p;
+  
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid) {
+      // Keep lock held - caller must release
+      return p;
     }
+    release(&p->lock);
   }
   return 0;
 }
